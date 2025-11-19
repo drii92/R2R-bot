@@ -1,12 +1,11 @@
-# bot_pro.py
-# ReadyToRent - Bot PRO
-# NOTE: Replace placeholders via environment variables in Render
 import os
 import logging
 from datetime import datetime
-from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, filters,
+    ContextTypes, ConversationHandler, CallbackQueryHandler
+)
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -14,29 +13,29 @@ from oauth2client.service_account import ServiceAccountCredentials
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS","").split(",") if x]
 SHEET_NAME = os.environ.get("SHEET_NAME", "R2R_Listings")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")  # full JSON
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
 
 if not BOT_TOKEN:
     raise Exception("BOT_TOKEN missing in env")
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Google Sheets helper
+# Google Sheets
 def gsheet_client():
-    creds_json = GOOGLE_CREDS_JSON
-    if not creds_json:
+    if not GOOGLE_CREDS_JSON:
         raise Exception("GOOGLE_CREDS_JSON missing")
-    # If looks like JSON, write to temp file
-    if creds_json.strip().startswith("{"):
+    if GOOGLE_CREDS_JSON.strip().startswith("{"):
         tmp = "/tmp/gcreds.json"
         with open(tmp, "w") as f:
-            f.write(creds_json)
+            f.write(GOOGLE_CREDS_JSON)
         creds_path = tmp
     else:
-        creds_path = creds_json
-    scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+        creds_path = GOOGLE_CREDS_JSON
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
     client = gspread.authorize(creds)
     return client
@@ -48,9 +47,11 @@ def ensure_sheet():
     except Exception:
         sh = client.create(SHEET_NAME)
     ws = sh.sheet1
-    header = ["timestamp","chat_id","user","city","price","m2","rent_est","state","url","notes","photo_filename","contact"]
-    existing = ws.row_values(1)
-    if not existing:
+    header = [
+        "timestamp","chat_id","user","city","price","m2",
+        "rent_est","state","url","notes","photo_filename","contact"
+    ]
+    if not ws.row_values(1):
         ws.insert_row(header, 1)
     return ws
 
@@ -63,7 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Buscar por ciudad", callback_data="menu_search")],
         [InlineKeyboardButton("Enviar piso para análisis", callback_data="menu_submit")],
         [InlineKeyboardButton("Plantilla / Dosier", callback_data="menu_template")],
-        [InlineKeyboardButton("Contactar admin", callback_data="menu_contact")]
+        [InlineKeyboardButton("Contactar admin", callback_data="menu_contact")],
     ]
     txt = f"Hola {user.first_name or ''}! Soy Ready2R Bot. Elige una opción."
     await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -72,44 +73,63 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
+
     if data == "menu_search":
-        await q.edit_message_text("Escribe la ciudad que te interesa o usa /madrid /valencia etc.")
-    elif data == "menu_submit":
-        await q.edit_message_text("Empezamos. ¿En qué ciudad está el piso? (ej: Madrid)")
+        await q.edit_message_text(
+            "Escribe la ciudad que te interesa o usa /madrid /valencia etc."
+        )
+        return ConversationHandler.END
+
+    if data == "menu_submit":
+        await q.edit_message_text(
+            "Empezamos. ¿En qué ciudad está el piso? (ej: Madrid)"
+        )
         return C_CITY
-    elif data == "menu_template":
-        await q.edit_message_text("Plantilla: usa este formato:\\n📍 Ubicación:\\n💶 Precio:\\n📐 m²:\\n🔧 Estado:\\n💸 Alquiler estimado:\\n🔗 Enlace:")
-    elif data == "menu_contact":
-        await q.edit_message.reply_text("Contacta con el admin: escribe /contacto")
-    return None
+
+    if data == "menu_template":
+        await q.edit_message_text(
+            "Plantilla: usa este formato:\n"
+            "📍 Ubicación:\n💶 Precio:\n📐 m²:\n🔧 Estado:\n💸 Alquiler estimado:\n🔗 Enlace:"
+        )
+        return ConversationHandler.END
+
+    if data == "menu_contact":
+        await q.edit_message_text(
+            "Contacta con el admin: escribe /contacto en el chat."
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+# --- Conversación envío de piso ---
 
 async def c_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['city'] = update.message.text.strip()
+    context.user_data["city"] = update.message.text.strip()
     await update.message.reply_text("Precio (ej. 139000)")
     return C_PRICE
 
 async def c_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['price'] = update.message.text.strip()
+    context.user_data["price"] = update.message.text.strip()
     await update.message.reply_text("Metros (m²)")
     return C_M2
 
 async def c_m2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['m2'] = update.message.text.strip()
+    context.user_data["m2"] = update.message.text.strip()
     await update.message.reply_text("Alquiler estimado (€/mes)")
     return C_RENT
 
 async def c_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['rent'] = update.message.text.strip()
-    await update.message.reply_text("Estado del piso (ej. Reformado / A reformar)")
+    context.user_data["rent"] = update.message.text.strip()
+    await update.message.reply_text("Estado del piso (Reformado / A reformar)")
     return C_STATE
 
 async def c_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['state'] = update.message.text.strip()
+    context.user_data["state"] = update.message.text.strip()
     await update.message.reply_text("Enlace al anuncio (si lo tienes) o escribe 'no'")
     return C_URL
 
 async def c_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['url'] = update.message.text.strip()
+    context.user_data["url"] = update.message.text.strip()
     await update.message.reply_text("Puedes enviar una foto ahora o escribir 'no'")
     return C_PHOTO
 
@@ -120,31 +140,62 @@ async def c_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = f"./uploads/{fname}"
         os.makedirs("./uploads", exist_ok=True)
         await file.download_to_drive(path)
-        context.user_data['photo'] = path
+        context.user_data["photo"] = path
     else:
-        context.user_data['photo'] = ""
-    await update.message.reply_text("Contacto del propietario / tu contacto (teléfono o email) o 'no'")
+        context.user_data["photo"] = ""
+    await update.message.reply_text(
+        "Contacto del propietario / tu contacto (teléfono o email) o 'no'"
+    )
     return C_CONTACT
 
 async def c_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['contact'] = update.message.text.strip()
+    context.user_data["contact"] = update.message.text.strip()
     s = context.user_data
-    summary = f"Resumen:\\nCiudad: {s.get('city')}\\nPrecio: {s.get('price')}\\nm2: {s.get('m2')}\\nAlquiler: {s.get('rent')}\\nEstado: {s.get('state')}\\nURL: {s.get('url')}\\nContacto: {s.get('contact')}"
-    await update.message.reply_text(summary + "\\n\\nConfirma 'si' para guardar o 'no' para cancelar.")
+    summary = (
+        "Resumen:\n"
+        f"Ciudad: {s.get('city')}\n"
+        f"Precio: {s.get('price')}\n"
+        f"m2: {s.get('m2')}\n"
+        f"Alquiler: {s.get('rent')}\n"
+        f"Estado: {s.get('state')}\n"
+        f"URL: {s.get('url')}\n"
+        f"Contacto: {s.get('contact')}"
+    )
+    await update.message.reply_text(
+        summary + "\n\nConfirma 'si' para guardar o 'no' para cancelar."
+    )
     return C_CONFIRM
 
 async def c_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip().lower()
-    if txt in ("si","sí","s"):
+    if txt in ("si", "sí", "s"):
         ws = ensure_sheet()
         s = context.user_data
-        row = [datetime.utcnow().isoformat(), update.effective_chat.id, update.effective_user.username or update.effective_user.full_name,
-               s.get('city'), s.get('price'), s.get('m2'), s.get('rent'), s.get('state'), s.get('url'), "", s.get('photo',''), s.get('contact')]
+        row = [
+            datetime.utcnow().isoformat(),
+            update.effective_chat.id,
+            update.effective_user.username or update.effective_user.full_name,
+            s.get("city"),
+            s.get("price"),
+            s.get("m2"),
+            s.get("rent"),
+            s.get("state"),
+            s.get("url"),
+            "",
+            s.get("photo", ""),
+            s.get("contact"),
+        ]
         ws.append_row(row)
-        await update.message.reply_text("Guardado. Gracias — un admin lo revisará y lo publicará si procede.")
+        await update.message.reply_text(
+            "Guardado. Gracias — un admin lo revisará y lo publicará si procede."
+        )
         for a in ADMIN_IDS:
             try:
-                await context.bot.send_message(a, f"Nuevo piso enviado por {update.effective_user.full_name}: {s.get('city')} {s.get('price')}")
+                await context.bot.send_message(
+                    a,
+                    f"Nuevo piso enviado por {update.effective_user.full_name}: "
+                    f"{s.get('city')} {s.get('price')}",
+                )
             except Exception as e:
                 logger.exception(e)
     else:
@@ -156,18 +207,18 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("No autorizado")
     ws = ensure_sheet()
     rows = ws.get_all_values()[-10:]
-    txt = "Últimos envíos:\\n"
+    txt = "Últimos envíos:\n"
     for r in rows[-10:]:
-        txt += f"- {r[0]} | {r[2]} | {r[3]} | {r[4]}€\\n"
+        txt += f"- {r[0]} | {r[2]} | {r[3]} | {r[4]}€\n"
     await update.message.reply_text(txt)
 
 async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text
     if txt.startswith("/"):
         city = txt[1:]
-        await update.message.reply_text(f"Buscando oportunidades en {city.capitalize()}... (implementa búsqueda en sheet)")
-    else:
-        await update.message.reply_text("Usa /madrid o escribe la ciudad.")
+        await update.message.reply_text(
+            f"Buscando oportunidades en {city.capitalize()}... (pendiente de implementar consulta a Sheet)"
+        )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception", exc_info=context.error)
@@ -175,13 +226,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         for a in ADMIN_IDS:
             try:
                 await context.bot.send_message(a, f"Error: {context.error}")
-            except:
+            except Exception:
                 pass
 
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(callback_menu, pattern="menu_submit"), CommandHandler("send", lambda u,c: callback_menu(u,c))],
+        entry_points=[
+            CallbackQueryHandler(callback_menu, pattern=r"^menu_submit$")
+        ],
         states={
             C_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_city)],
             C_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_price)],
@@ -193,12 +247,16 @@ def build_app():
             C_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_contact)],
             C_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_confirm)],
         },
-        fallbacks=[CommandHandler('cancel', lambda u,c: (u.message.reply_text("Cancelado."), ConversationHandler.END)[1])]
+        fallbacks=[
+            CommandHandler("cancel", lambda u, c: (u.message.reply_text("Cancelado."), ConversationHandler.END)[1])
+        ],
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callback_menu, pattern="menu_"))
+    # Conversación primero
     app.add_handler(conv)
+    # Y luego el resto de botones (search / template / contact)
+    app.add_handler(CallbackQueryHandler(callback_menu, pattern=r"^menu_(search|template|contact)$"))
     app.add_handler(CommandHandler("lista", admin_list))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler))
     app.add_error_handler(error_handler)
