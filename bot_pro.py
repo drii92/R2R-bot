@@ -1,12 +1,13 @@
 # bot_pro.py
-# Ready2Rent - Bot PRO (versión lista para pegar)
-# Reemplaza TODO el contenido anterior por este archivo.
-# Requisitos: python-telegram-bot==20.3, gspread, oauth2client
+# Ready2Rent - Bot PRO (con menú: Busco / Vendo / Manuales / Contacto)
+# Requisitos:
+# pip install python-telegram-bot==20.3 gspread oauth2client
 
 import os
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import List, Dict, Any
 
 from telegram import (
     Update,
@@ -23,7 +24,6 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-# Google Sheets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -32,11 +32,12 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ----------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
+ADMIN_NOTIFY = os.environ.get("ADMIN_NOTIFY", "@juanpedro233")  # puede ser @username o id
 SHEET_NAME = os.environ.get("SHEET_NAME", "R2R_Listings")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")  # recomendado
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
+SAMPLE_PDF_URL = os.environ.get("SAMPLE_PDF_URL", "https://example.com/calculadora_rentabilidad.pdf")
 
-# Validación mínima
 if not BOT_TOKEN:
     raise Exception("BOT_TOKEN missing in env")
 
@@ -48,33 +49,21 @@ logger = logging.getLogger("r2r-bot")
 # Google Sheets helpers
 # ----------------------------
 def gsheet_client():
-    """
-    Inicializa cliente gspread usando la variable GOOGLE_CREDS_JSON
-    Soporta tanto JSON pegado en la var de entorno como ruta a fichero.
-    """
     if not GOOGLE_CREDS_JSON:
         raise Exception("GOOGLE_CREDS_JSON missing in env")
-
-    # Si la variable contiene JSON crudo, lo volcamos a /tmp/gcreds.json
     if GOOGLE_CREDS_JSON.strip().startswith("{"):
         tmp_path = "/tmp/gcreds.json"
         with open(tmp_path, "w") as f:
             f.write(GOOGLE_CREDS_JSON)
         creds_path = tmp_path
     else:
-        creds_path = GOOGLE_CREDS_JSON  # asumimos ruta
-
+        creds_path = GOOGLE_CREDS_JSON
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
     client = gspread.authorize(creds)
     return client
 
 def ensure_sheet():
-    """
-    Devuelve el worksheet principal. Intenta abrir por SPREADSHEET_ID si existe,
-    si no intenta abrir por nombre SHEET_NAME. No crea hojas en Drive de la
-    cuenta service account (para evitar quota issues). Si no existe, lanza excepción.
-    """
     client = gsheet_client()
     try:
         if SPREADSHEET_ID:
@@ -82,14 +71,12 @@ def ensure_sheet():
         else:
             sh = client.open(SHEET_NAME)
     except Exception as e:
-        # Mensaje claro para que el admin solucione: crear la hoja y compartirla
         logger.exception("Error abriendo la hoja en Google Sheets")
         raise Exception(
             "No se pudo abrir la hoja en Google Sheets. "
-            "Asegúrate de crear la hoja y compartirla con el client_email de la service account, "
-            "o define SPREADSHEET_ID en env."
+            "Crea la hoja y compártela con el client_email de la service account, "
+            "o define SPREADSHEET_ID."
         ) from e
-
     ws = sh.sheet1
     header = [
         "timestamp",
@@ -113,12 +100,11 @@ def ensure_sheet():
         try:
             ws.insert_row(header, 1)
         except Exception:
-            # si falla insertar cabecera (permiso, quota), lo ignoramos pero avisamos
-            logger.warning("No se pudo insertar header en la hoja (posible falta de permisos).")
+            logger.warning("No se pudo insertar header (posible falta de permisos).")
     return ws
 
 # ----------------------------
-# Conversation states
+# Conversation states (venta y contacto)
 # ----------------------------
 (
     C_CITY,
@@ -130,9 +116,10 @@ def ensure_sheet():
     C_PHOTO,
     C_CONTACT,
     C_CONFIRM,
-) = range(9)
+    CONTACT_MSG,
+) = range(10)
 
-# Cache username del bot
+# cache bot username
 BOT_USERNAME = None
 
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE):
@@ -144,7 +131,7 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE):
     return BOT_USERNAME
 
 # ----------------------------
-# /start - SOLO en privado muestra el menú
+# Menú principal (solo en privado)
 # ----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -153,29 +140,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat.type == "private":
         kb = [
-            [InlineKeyboardButton("Buscar por ciudad", callback_data="menu_search")],
-            [InlineKeyboardButton("Enviar piso para análisis", callback_data="menu_submit")],
-            [InlineKeyboardButton("Plantilla / Dosier", callback_data="menu_template")],
-            [InlineKeyboardButton("Contactar admin", callback_data="menu_contact")],
+            [InlineKeyboardButton("Busco una casa", callback_data="menu_search")],
+            [InlineKeyboardButton("Vendo una casa", callback_data="menu_sell")],
+            [InlineKeyboardButton("Manuales / Herramientas útiles", callback_data="menu_manuals")],
+            [InlineKeyboardButton("Contacto", callback_data="menu_contact")],
         ]
-        txt = f"Hola {user.first_name or ''}! Soy Ready2R Bot. Elige una opción."
+        txt = f"Hola {user.first_name or ''}! ¿Qué necesitas hoy?"
         await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else:
-        # Si se usa en grupo, damos instrucción breve y no iniciamos formulario
         msg = (
-            "Para enviar un piso o usar el formulario, háblame por privado 👉 "
+            "Para usar el bot y enviar una casa, háblame en privado 👉 "
             f"@{bot_username} y escribe /start\n\n"
             "En este grupo usa comandos públicos como /madrid o /valencia."
         )
-        # Respond as reply to reduce noise
         if update.message:
             await update.message.reply_text(msg)
         else:
             await context.bot.send_message(chat.id, msg)
 
 # ----------------------------
-# CallbackQuery handler: si el keyboard está en grupo -> fuerza DM
-# Si está en privado procesa normalmente.
+# Callback handler para el menú (gestiona privado/grupo)
 # ----------------------------
 async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -185,52 +169,163 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = q.from_user
     bot_username = await get_bot_username(context)
 
-    # Si el teclado fue mostrado en un grupo -> pedimos DM
+    # Si teclado en grupo => pedimos DM
     if chat.type in ("group", "supergroup", "channel"):
         warn = (
-            "Este formulario solo funciona en privado.\n\n"
-            f"Pulsa aquí 👉 @{bot_username} y escribe /start para abrir el menú privado."
+            "Esta función solo funciona en privado. Pulsa aquí 👉 "
+            f"@{bot_username} y escribe /start"
         )
-        # Intentamos editar el mensaje para reducir ruido; si no se puede, enviamos un DM
         try:
-            await q.edit_message_text("Este formulario solo funciona en privado. Comprueba tu chat con el bot.")
+            await q.edit_message_text("Esta opción solo funciona en privado. Comprueba tu chat con el bot.")
         except Exception:
             pass
-        # Intentar enviar aviso privado al usuario
         try:
             await context.bot.send_message(user.id, warn)
         except Exception:
-            # Si no puede DM, enviar un mensaje corto en el grupo (menos intrusivo)
             try:
                 await context.bot.send_message(chat.id, f"{user.first_name}, revisa tu chat privado con @{bot_username}.")
             except Exception:
                 pass
-        return ConversationHandler.END
+        return
 
-    # Si estamos en privado, procesamos cada opción
+    # Si estamos en privado, procesar cada opción
     if data == "menu_search":
-        await q.edit_message_text("Escribe la ciudad que te interesa o usa /madrid /valencia etc.")
-        return ConversationHandler.END
+        # mostrar opciones de orden
+        kb = [
+            [InlineKeyboardButton("Top por rentabilidad", callback_data="search_sort_yield")],
+            [InlineKeyboardButton("Top por precio (más barato)", callback_data="search_sort_price")],
+            [InlineKeyboardButton("Buscar por ciudad", callback_data="search_by_city")],
+            [InlineKeyboardButton("Volver", callback_data="menu_back")],
+        ]
+        await q.edit_message_text("Elige cómo quieres ver las propiedades:", reply_markup=InlineKeyboardMarkup(kb))
+        return
 
-    if data == "menu_submit":
-        await q.edit_message_text("Empezamos. ¿En qué ciudad está el piso? (ej: Madrid)")
+    if data == "menu_sell":
+        await q.edit_message_text("Perfecto. Empezamos. ¿En qué ciudad está el piso? (ej: Madrid)")
         return C_CITY
 
-    if data == "menu_template":
-        await q.edit_message_text(
-            "Plantilla: usa este formato:\n"
-            "📍 Ubicación:\n💶 Precio:\n📐 m²:\n🔧 Estado:\n💸 Alquiler estimado:\n🔗 Enlace:"
-        )
-        return ConversationHandler.END
+    if data == "menu_manuals":
+        # Mostrar lista de manuales (por ahora uno)
+        txt = "Manuales / Herramientas disponibles:\n\n"
+        txt += f"- Calculadora de rentabilidad (PDF): {SAMPLE_PDF_URL}\n\n"
+        txt += "Si quieres más dosieres, los añadiremos y te avisamos."
+        await q.edit_message_text(txt)
+        return
 
     if data == "menu_contact":
-        await q.edit_message_text("Contacta con el admin: escribe /contacto en el chat.")
-        return ConversationHandler.END
+        await q.edit_message_text("Escribe el mensaje que quieres enviar al equipo (respuesta directa al admin).")
+        return CONTACT_MSG
 
-    return ConversationHandler.END
+    if data == "menu_back":
+        await q.edit_message_text("Menú principal. /start para volver.")
+        return
+
+    # search sub-options
+    if data == "search_sort_yield":
+        await q.edit_message_text("Buscando por rentabilidad (top 5)...")
+        await send_listings_sorted(context, q.from_user.id, sort_by="yield")
+        return
+
+    if data == "search_sort_price":
+        await q.edit_message_text("Buscando por precio (más barato, top 5)...")
+        await send_listings_sorted(context, q.from_user.id, sort_by="price")
+        return
+
+    if data == "search_by_city":
+        await q.edit_message_text("Escribe el nombre de la ciudad que quieres buscar (ej: Madrid).")
+        # Next message will be handled by city_search_message
+        context.user_data["awaiting_city_search"] = True
+        return
+
+    return
 
 # ----------------------------
-# Conversational flow: enviar piso - funciones por estado
+# Enviar listados: leer sheet, calcular yield y ordenar
+# ----------------------------
+def safe_float(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return None
+
+def parse_listing_row(row: List[str]) -> Dict[str, Any]:
+    # Our header expected:
+    # timestamp, chat_id, user, city, price, m2, rent_est, state, url, notes, photo_filename, contact
+    data = {}
+    data["timestamp"] = row[0] if len(row) > 0 else ""
+    data["chat_id"] = row[1] if len(row) > 1 else ""
+    data["user"] = row[2] if len(row) > 2 else ""
+    data["city"] = row[3] if len(row) > 3 else ""
+    data["price"] = safe_float(row[4]) if len(row) > 4 else None
+    data["m2"] = safe_float(row[5]) if len(row) > 5 else None
+    data["rent_est"] = safe_float(row[6]) if len(row) > 6 else None
+    data["state"] = row[7] if len(row) > 7 else ""
+    data["url"] = row[8] if len(row) > 8 else ""
+    data["notes"] = row[9] if len(row) > 9 else ""
+    data["photo"] = row[10] if len(row) > 10 else ""
+    data["contact"] = row[11] if len(row) > 11 else ""
+    # compute yield_net_approx = (rent_est * 12) / price * 100  (percent)
+    if data["price"] and data["rent_est"] and data["price"] != 0:
+        try:
+            data["yield"] = round((data["rent_est"] * 12) / data["price"] * 100, 2)
+        except Exception:
+            data["yield"] = None
+    else:
+        data["yield"] = None
+    return data
+
+async def send_listings_sorted(context: ContextTypes.DEFAULT_TYPE, chat_id, sort_by="yield"):
+    try:
+        ws = ensure_sheet()
+        rows = ws.get_all_records()
+    except Exception as e:
+        logger.exception("Error leyendo sheet para listados")
+        await context.bot.send_message(chat_id, "No puedo leer las oportunidades ahora. Revisa configuración.")
+        return
+
+    listings = [parse_listing_row([
+        r.get("timestamp",""),
+        r.get("chat_id",""),
+        r.get("user",""),
+        r.get("city",""),
+        r.get("price",""),
+        r.get("m2",""),
+        r.get("rent_est",""),
+        r.get("state",""),
+        r.get("url",""),
+        r.get("notes",""),
+        r.get("photo_filename",""),
+        r.get("contact",""),
+    ]) for r in rows]
+
+    # filter out empty price and rent if sorting by yield
+    if sort_by == "yield":
+        listings = [l for l in listings if l.get("yield") is not None]
+        listings.sort(key=lambda x: (x.get("yield") is None, -(x.get("yield") or 0)))
+    elif sort_by == "price":
+        listings = [l for l in listings if l.get("price") is not None]
+        listings.sort(key=lambda x: (x.get("price") is None, x.get("price") or 0))
+    elif sort_by == "city":
+        listings.sort(key=lambda x: (x.get("city") or "").lower())
+
+    top = listings[:5]
+    if not top:
+        await context.bot.send_message(chat_id, "No hay listados disponibles con esos criterios.")
+        return
+
+    for l in top:
+        txt = f"🏠 {l.get('city') or '—'} · Precio: {l.get('price') or '—'}€ · m²: {l.get('m2') or '—'}\n"
+        if l.get("yield") is not None:
+            txt += f"📈 Yield aprox.: {l['yield']} %\n"
+        if l.get("url"):
+            txt += f"🔗 {l.get('url')}\n"
+        if l.get("contact"):
+            txt += f"📞 {l.get('contact')}\n"
+        txt += f"Publicado: {l.get('timestamp')}\n"
+        await context.bot.send_message(chat_id, txt)
+
+# ----------------------------
+# Conversational flow: "Vendo una casa" (en privado)
 # ----------------------------
 async def c_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["city"] = update.message.text.strip()
@@ -263,7 +358,6 @@ async def c_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return C_PHOTO
 
 async def c_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Soportamos foto o 'no'
     if update.message.photo:
         file = await update.message.photo[-1].get_file()
         fname = f"photo_{update.effective_user.id}_{int(datetime.utcnow().timestamp())}.jpg"
@@ -273,7 +367,6 @@ async def c_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file.download_to_drive(path)
             context.user_data["photo"] = path
         except Exception:
-            # si falla guardar, lo registramos y seguimos
             logger.exception("Error descargando la foto")
             context.user_data["photo"] = ""
     else:
@@ -319,21 +412,25 @@ async def c_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             ws.append_row(row)
             await update.message.reply_text("Guardado. Gracias — un admin lo revisará y lo publicará si procede.")
-            # Notificar admins
+            # Notificar admin principal (ADMIN_NOTIFY) del nuevo piso ofrecido
+            try:
+                target = ADMIN_NOTIFY
+                # si es un id numérico
+                if str(target).isdigit():
+                    await context.bot.send_message(int(target), f"nuevo piso ofrecido · {s.get('city')} · {s.get('price')}")
+                else:
+                    await context.bot.send_message(target, f"nuevo piso ofrecido · {s.get('city')} · {s.get('price')}")
+            except Exception:
+                logger.exception("Error notificando admin via ADMIN_NOTIFY")
+            # Notificar también los ADMIN_IDS si hay
             for a in ADMIN_IDS:
                 try:
-                    await context.bot.send_message(
-                        a,
-                        f"Nuevo piso enviado por {update.effective_user.full_name}: {s.get('city')} {s.get('price')}",
-                    )
+                    await context.bot.send_message(a, f"Nuevo piso ofrecido por {update.effective_user.full_name}: {s.get('city')} {s.get('price')}")
                 except Exception:
-                    logger.exception("Error notificando admin")
+                    logger.exception("Error notificando admin id")
         except Exception as e:
             logger.exception("Error guardando en sheet")
-            await update.message.reply_text(
-                "Hubo un problema guardando el piso. Avisaré a un admin para que lo revise."
-            )
-            # Notify admin with the error
+            await update.message.reply_text("Hubo un problema guardando el piso. Avisaré a un admin para que lo revise.")
             for a in ADMIN_IDS:
                 try:
                     await context.bot.send_message(a, f"Error guardando envío: {e}")
@@ -344,6 +441,35 @@ async def c_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ----------------------------
+# Contacto: recoger texto y reenviar al admin
+# ----------------------------
+async def contact_message_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Entrada desde menu "Contacto" - ya handled returning CONTACT_MSG
+    await update.message.reply_text("Escribe el mensaje que quieres que recibamos (responderemos por privado).")
+    return CONTACT_MSG
+
+async def contact_message_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    sender = update.effective_user
+    try:
+        target = ADMIN_NOTIFY
+        forward_text = f"Mensaje de contacto de @{sender.username or sender.full_name} ({sender.id}):\n\n{text}"
+        if str(target).isdigit():
+            await context.bot.send_message(int(target), forward_text)
+        else:
+            await context.bot.send_message(target, forward_text)
+        await update.message.reply_text("Mensaje enviado. Gracias, te responderemos por privado si procede.")
+    except Exception:
+        logger.exception("Error reenviando mensaje de contacto")
+        await update.message.reply_text("No he podido reenviar el mensaje. Avisaré a los admins.")
+        for a in ADMIN_IDS:
+            try:
+                await context.bot.send_message(a, f"Error reenviando mensaje contacto de {sender.id}: {text}")
+            except Exception:
+                pass
+    return ConversationHandler.END
+
+# ----------------------------
 # Admin command: lista (últimos envíos)
 # ----------------------------
 async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -351,28 +477,62 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("No autorizado")
     try:
         ws = ensure_sheet()
-        rows = ws.get_all_values()[-10:]
+        rows = ws.get_all_records()[-10:]
         txt = "Últimos envíos:\n"
-        for r in rows[-10:]:
-            txt += f"- {r[0]} | {r[2]} | {r[3]} | {r[4]}€\n"
+        for r in rows:
+            txt += f"- {r.get('timestamp','')} | {r.get('user','')} | {r.get('city','')} | {r.get('price','')}€\n"
         await update.message.reply_text(txt)
     except Exception as e:
         logger.exception("Error en admin_list")
         await update.message.reply_text("Error leyendo la hoja. Revisa permisos y SPREADSHEET_ID.")
 
 # ----------------------------
-# /madrid or /city simple handler (public)
+# City search if user typed a city after clicking "Buscar por ciudad"
 # ----------------------------
-async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text
-    if not txt.startswith("/"):
+async def city_search_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_city_search"):
         return
-    city = txt[1:].strip()
-    # Aquí solo una respuesta placeholder. Más adelante se puede implementar consulta a Sheets
-    await update.message.reply_text(f"Buscando oportunidades en {city.capitalize()}... (próximamente).")
+    city = update.message.text.strip().lower()
+    context.user_data["awaiting_city_search"] = False
+    # read sheet and filter by city
+    try:
+        ws = ensure_sheet()
+        rows = ws.get_all_records()
+    except Exception as e:
+        logger.exception("Error leyendo sheet para búsqueda por ciudad")
+        await update.message.reply_text("No puedo leer las oportunidades ahora. Revisa configuración.")
+        return
+    results = []
+    for r in rows:
+        if str(r.get("city","")).strip().lower() == city:
+            results.append(parse_listing_row([
+                r.get("timestamp",""),
+                r.get("chat_id",""),
+                r.get("user",""),
+                r.get("city",""),
+                r.get("price",""),
+                r.get("m2",""),
+                r.get("rent_est",""),
+                r.get("state",""),
+                r.get("url",""),
+                r.get("notes",""),
+                r.get("photo_filename",""),
+                r.get("contact",""),
+            ]))
+    if not results:
+        await update.message.reply_text(f"No he encontrado listados para {city.capitalize()}.")
+        return
+    # show up to 5
+    for l in results[:5]:
+        txt = f"🏠 {l.get('city')} · Precio: {l.get('price') or '—'}€ · m²: {l.get('m2') or '—'}\n"
+        if l.get("yield") is not None:
+            txt += f"📈 Yield aprox.: {l['yield']} %\n"
+        if l.get("url"):
+            txt += f"🔗 {l.get('url')}\n"
+        await update.message.reply_text(txt)
 
 # ----------------------------
-# Welcome handler: nuevos miembros en grupo
+# Welcome new members
 # ----------------------------
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -391,7 +551,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             logger.exception("Error enviando bienvenida en el grupo")
 
-        # Intento de DM al usuario (si permite DMs)
+        # Intentamos DM al usuario
         try:
             dm = (
                 f"Hola {member.first_name or ''}! Bienvenido a Ready2R.\n\n"
@@ -400,7 +560,6 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await context.bot.send_message(member.id, dm)
         except Exception:
-            # el usuario puede tener DMs cerrados; lo ignoramos
             pass
 
 # ----------------------------
@@ -408,7 +567,6 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ----------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception", exc_info=context.error)
-    # Notificar a admins
     for a in ADMIN_IDS:
         try:
             await context.bot.send_message(a, f"Error en bot: {context.error}")
@@ -416,14 +574,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ----------------------------
-# Build app and register handlers
+# Build app and handlers
 # ----------------------------
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Conversation handler (entrada por callback menu 'menu_submit' en privado)
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(callback_menu, pattern=r"^menu_submit$")],
+    # Conversation handler for selling (entry via callback menu 'menu_sell')
+    sell_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(callback_menu, pattern=r"^menu_sell$")],
         states={
             C_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_city)],
             C_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_price)],
@@ -444,27 +602,48 @@ def build_app():
         allow_reentry=True,
     )
 
-    # Handlers registration order matters
+    # Conversation handler for contact messages (entry via callback menu 'menu_contact')
+    contact_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(callback_menu, pattern=r"^menu_contact$")],
+        states={
+            CONTACT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_message_save)],
+        },
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                lambda u, c: (u.message.reply_text("Cancelado."), ConversationHandler.END)[1]
+            )
+        ],
+        allow_reentry=True,
+    )
+
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
-    # CallbackQueryHandler para las opciones públicas (search/template/contact) en privado,
-    # y que en grupo forcen DM (callback_menu maneja ambos casos).
-    app.add_handler(CallbackQueryHandler(callback_menu, pattern=r"^menu_(search|template|contact)$"))
+    app.add_handler(sell_conv)
+    app.add_handler(contact_conv)
+    # CallbackQueryHandler para search subcommands y manual/menu handling
+    app.add_handler(CallbackQueryHandler(callback_menu, pattern=r"^menu_|^search_|^menu_back$"))
     app.add_handler(CommandHandler("lista", admin_list))
-    # city commands (e.g. /madrid)
-    app.add_handler(MessageHandler(filters.Regex(r"^/[a-zA-ZñÑáéíóúÁÉÍÓÚ]+$"), city_handler))
-    # Welcome new members
+    app.add_handler(MessageHandler(filters.Regex(r"^/[a-zA-ZñÑáéíóúÁÉÍÓÚ]+$"), city_command_handler := (lambda u,c: city_handler(u,c))))
+    # handler para texto luego de "Buscar por ciudad"
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, city_search_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
-    # Error handler
     app.add_error_handler(error_handler)
 
     return app
+
+# small wrapper to satisfy city command usage
+async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    if not txt.startswith("/"):
+        return
+    city = txt[1:].strip()
+    await update.message.reply_text(f"Buscando oportunidades en {city.capitalize()}... (próximamente).")
 
 # ----------------------------
 # Entrypoint
 # ----------------------------
 if __name__ == "__main__":
-    logger.info("Starting Ready2R Bot...")
+    logger.info("Starting Ready2R Bot (full menu)...")
     app = build_app()
-    # run polling (ya estás sobre Render en background worker)
     app.run_polling(poll_interval=3)
